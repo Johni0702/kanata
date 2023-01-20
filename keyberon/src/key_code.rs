@@ -818,6 +818,10 @@ impl KeyCode {
         KeyCode::LCtrl <= self && self <= KeyCode::RGui
     }
 
+    pub fn is_mouse(self) -> bool {
+        KeyCode::K272 <= self && self <= KeyCode::K278
+    }
+
     /// Returns the byte with the bit corresponding to the USB HID
     /// modifier bitfield set.
     pub fn as_modifier_bit(self) -> u8 {

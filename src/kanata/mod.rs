@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
 use std::sync::Arc;
 use std::time;
 
-use crate::cfg::LayerInfo;
+use crate::cfg::{LayerInfo, Output};
 use crate::custom_action::*;
 use crate::keys::*;
 use crate::oskbd::*;
@@ -35,12 +35,12 @@ pub enum DynamicMacroItem {
 
 pub struct Kanata {
     pub kbd_in_paths: Vec<String>,
-    pub kbd_out: KbdOut,
+    pub kbd_out: Vec<KbdOut>,
     pub cfg_path: PathBuf,
     pub mapped_keys: cfg::MappedKeys,
     pub key_outputs: cfg::KeyOutputs,
     pub layout: cfg::KanataLayout,
-    pub prev_keys: Vec<KeyCode>,
+    pub prev_keys: Vec<Vec<KeyCode>>,
     pub layer_info: Vec<LayerInfo>,
     pub prev_layer: usize,
     pub scroll_state: Option<ScrollState>,
@@ -163,6 +163,10 @@ impl Kanata {
         #[cfg(all(feature = "interception_driver", target_os = "windows"))]
         let (kbd_out_tx, kbd_out_rx) = crossbeam_channel::unbounded();
         #[cfg(all(feature = "interception_driver", target_os = "windows"))]
+        let kbd_out = vec![KbdOut::new(kbd_out_tx).unwrap()];
+        #[cfg(all(not(feature = "interception_driver"), target_os = "windows"))]
+        let kbd_out = vec![KbdOut::new().unwrap()];
+        #[cfg(all(feature = "interception_driver", target_os = "windows"))]
         let intercept_mouse_hwid = cfg
             .items
             .get("windows-interception-mouse-hwid")
@@ -179,18 +183,26 @@ impl Kanata {
             })
             .unwrap_or_default();
 
-        let kbd_out = match KbdOut::new(
-            #[cfg(target_os = "linux")]
-            &args.symlink_path,
-            #[cfg(all(feature = "interception_driver", target_os = "windows"))]
-            kbd_out_tx,
-        ) {
-            Ok(kbd_out) => kbd_out,
-            Err(err) => {
-                error!("Failed to open the output uinput device. Make sure you've added kanata to the `uinput` group");
-                bail!(err)
-            }
-        };
+        #[cfg(target_os = "linux")]
+        let kbd_out = if cfg.outputs.is_empty() {
+            vec![Output {
+                name: "default".to_owned(),
+                path: args.symlink_path.to_owned(),
+            }]
+        } else {
+            cfg.outputs.clone()
+        }
+        .iter()
+        .map(|output| {
+            KbdOut::new(&output.path).map_err(|err| {
+                error!(
+                    "Failed to open the output uinput device. \
+                        Make sure you've added kanata to the `uinput` group"
+                );
+                err.into()
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
         #[cfg(target_os = "linux")]
         let kbd_in_paths = cfg
@@ -231,6 +243,8 @@ impl Kanata {
             .transpose()?
             .unwrap_or(SequenceInputMode::HiddenSuppressed);
 
+        let outputs = kbd_out.len();
+
         Ok(Self {
             kbd_in_paths,
             kbd_out,
@@ -239,7 +253,7 @@ impl Kanata {
             key_outputs: cfg.key_outputs,
             layout: cfg.layout,
             layer_info: cfg.layer_info,
-            prev_keys: Vec::new(),
+            prev_keys: vec![Vec::new(); outputs],
             prev_layer: 0,
             scroll_state: None,
             hscroll_state: None,
@@ -305,14 +319,19 @@ impl Kanata {
 
         for _ in 0..ms_elapsed {
             let custom_event = self.layout.tick();
-            let cur_keys = self.handle_keystate_changes()?;
+            let cur_keys = (0..self.kbd_out.len())
+                .map(|idx| self.handle_keystate_changes(idx))
+                .collect::<Result<Vec<_>>>()?;
             live_reload_requested |= self.handle_custom_event(custom_event)?;
             self.handle_scrolling()?;
             self.handle_move_mouse()?;
             self.tick_sequence_state()?;
             self.tick_dynamic_macro_state()?;
 
-            if live_reload_requested && self.prev_keys.is_empty() && cur_keys.is_empty() {
+            if live_reload_requested
+                && self.prev_keys.iter().all(|it| it.is_empty())
+                && cur_keys.iter().all(|it| it.is_empty())
+            {
                 live_reload_requested = false;
                 if let Err(e) = self.do_live_reload() {
                     log::error!("live reload failed {e}");
@@ -347,7 +366,9 @@ impl Kanata {
                     match custact {
                         // For unicode, only send on the press. No repeat action is supported for this for
                         // now.
-                        CustomAction::Unicode(c) => self.kbd_out.send_unicode(*c)?,
+                        CustomAction::Unicode(c) => {
+                            self.kbd_out[self.layout.current_key_output()].send_unicode(*c)?
+                        }
                         CustomAction::LiveReload => {
                             live_reload_requested = true;
                             log::info!("Requested live reload")
@@ -356,16 +377,17 @@ impl Kanata {
                             log::debug!("click     {:?}", btn);
                             if let Some(pbtn) = prev_mouse_btn {
                                 log::debug!("unclick   {:?}", pbtn);
-                                self.kbd_out.release_btn(pbtn)?;
+                                self.kbd_out[self.layout.current_mouse_output()]
+                                    .release_btn(pbtn)?;
                             }
-                            self.kbd_out.click_btn(*btn)?;
+                            self.kbd_out[self.layout.current_mouse_output()].click_btn(*btn)?;
                             prev_mouse_btn = Some(*btn);
                         }
                         CustomAction::MouseTap(btn) => {
                             log::debug!("click     {:?}", btn);
-                            self.kbd_out.click_btn(*btn)?;
+                            self.kbd_out[self.layout.current_mouse_output()].click_btn(*btn)?;
                             log::debug!("unclick   {:?}", btn);
-                            self.kbd_out.release_btn(*btn)?;
+                            self.kbd_out[self.layout.current_mouse_output()].release_btn(*btn)?;
                         }
                         CustomAction::MWheel {
                             direction,
@@ -497,9 +519,10 @@ impl Kanata {
                             let key = OsCode::from(LAST_PRESSED_KEY.load(SeqCst));
                             log::debug!("repeating a keypress {key:?}");
                             // Release key in case the most recently pressed key is still pressed.
-                            self.kbd_out.release_key(key)?;
-                            self.kbd_out.press_key(key)?;
-                            self.kbd_out.release_key(key)?;
+                            let kbd_out = &mut self.kbd_out[self.layout.current_key_output()];
+                            kbd_out.release_key(key)?;
+                            kbd_out.press_key(key)?;
+                            kbd_out.release_key(key)?;
                         }
                         CustomAction::DynamicMacroRecord(key) => {
                             let mut stop_record = false;
@@ -700,7 +723,7 @@ impl Kanata {
                     })
                     .map(|btn| {
                         log::debug!("unclick   {:?}", btn);
-                        self.kbd_out.release_btn(*btn)
+                        self.kbd_out[self.layout.current_mouse_output()].release_btn(*btn)
                     })
                 {
                     bail!(e);
@@ -715,7 +738,7 @@ impl Kanata {
         if let Some(scroll_state) = &mut self.scroll_state {
             if scroll_state.ticks_until_scroll == 0 {
                 scroll_state.ticks_until_scroll = scroll_state.interval - 1;
-                self.kbd_out
+                self.kbd_out[self.layout.current_mouse_output()]
                     .scroll(scroll_state.direction, scroll_state.distance)?;
             } else {
                 scroll_state.ticks_until_scroll -= 1;
@@ -724,7 +747,7 @@ impl Kanata {
         if let Some(hscroll_state) = &mut self.hscroll_state {
             if hscroll_state.ticks_until_scroll == 0 {
                 hscroll_state.ticks_until_scroll = hscroll_state.interval - 1;
-                self.kbd_out
+                self.kbd_out[self.layout.current_mouse_output()]
                     .scroll(hscroll_state.direction, hscroll_state.distance)?;
             } else {
                 hscroll_state.ticks_until_scroll -= 1;
@@ -748,7 +771,7 @@ impl Kanata {
             }
             if mmsv.ticks_until_move == 0 {
                 mmsv.ticks_until_move = mmsv.interval - 1;
-                self.kbd_out.move_mouse(mmsv.direction, mmsv.distance)?;
+                self.kbd_out[self.layout.current_mouse_output()].move_mouse(mmsv.direction, mmsv.distance)?;
             } else {
                 mmsv.ticks_until_move -= 1;
             }
@@ -767,7 +790,7 @@ impl Kanata {
             }
             if mmsh.ticks_until_move == 0 {
                 mmsh.ticks_until_move = mmsh.interval - 1;
-                self.kbd_out.move_mouse(mmsh.direction, mmsh.distance)?;
+                self.kbd_out[self.layout.current_mouse_output()].move_mouse(mmsh.direction, mmsh.distance)?;
             } else {
                 mmsh.ticks_until_move -= 1;
             }
@@ -784,8 +807,8 @@ impl Kanata {
                     SequenceInputMode::HiddenDelayType => {
                         for code in state.sequence.iter().copied() {
                             if let Some(osc) = OsCode::from_u16(code) {
-                                self.kbd_out.press_key(osc)?;
-                                self.kbd_out.release_key(osc)?;
+                                self.kbd_out[self.layout.current_key_output()].press_key(osc)?;
+                                self.kbd_out[self.layout.current_key_output()].release_key(osc)?;
                             }
                         }
                     }
@@ -824,17 +847,21 @@ impl Kanata {
         Ok(())
     }
 
-    fn release_with_keyberon_output(&mut self, cur_keys: &[KeyCode]) -> Result<()> {
+    fn release_with_keyberon_output(
+        &mut self,
+        output_idx: usize,
+        cur_keys: &[KeyCode],
+    ) -> Result<()> {
         // Release keys that are missing from the current state but exist in the previous
         // state. It's important to iterate using a Vec because the order matters. This used to
         // use HashSet for computing `difference` but that iteration order is random which is
         // not what we want.
-        for k in &self.prev_keys {
+        for k in &self.prev_keys[output_idx] {
             if cur_keys.contains(k) {
                 continue;
             }
             log::debug!("key release   {:?}", k);
-            if let Err(e) = self.kbd_out.release_key(k.into()) {
+            if let Err(e) = self.kbd_out[output_idx].release_key(k.into()) {
                 bail!("failed to release key: {:?}", e);
             }
         }
@@ -843,15 +870,15 @@ impl Kanata {
 
     /// Sends OS key events according to the change in key state between the current and the
     /// previous keyberon keystate. Returns the current keys.
-    fn handle_keystate_changes(&mut self) -> Result<Vec<KeyCode>> {
-        let cur_keys: Vec<KeyCode> = self.layout.keycodes().collect();
+    fn handle_keystate_changes(&mut self, output_idx: usize) -> Result<Vec<KeyCode>> {
+        let cur_keys: Vec<KeyCode> = self.layout.keycodes_for_output(output_idx).collect();
         self.check_release_non_physical_shift()?;
-        self.release_with_keyberon_output(&cur_keys)?;
+        self.release_with_keyberon_output(output_idx, &cur_keys)?;
         // Press keys that exist in the current state but are missing from the previous state.
         // Comment above regarding Vec/HashSet also applies here.
         for k in &cur_keys {
             log::trace!("{k:?} is pressed");
-            if self.prev_keys.contains(k) {
+            if self.prev_keys[output_idx].contains(k) {
                 log::trace!("{k:?} is contained");
                 continue;
             }
@@ -859,7 +886,7 @@ impl Kanata {
             match &mut self.sequence_state {
                 None => {
                     log::debug!("key press     {:?}", k);
-                    if let Err(e) = self.kbd_out.press_key(k.into()) {
+                    if let Err(e) = self.kbd_out[output_idx].press_key(k.into()) {
                         bail!("failed to press key: {:?}", e);
                     }
                 }
@@ -869,7 +896,7 @@ impl Kanata {
                     state.sequence.push(u16::from(osc));
                     match self.sequence_input_mode {
                         SequenceInputMode::VisibleBackspaced => {
-                            self.kbd_out.press_key(osc)?;
+                            self.kbd_out[output_idx].press_key(osc)?;
                         }
                         SequenceInputMode::HiddenSuppressed
                         | SequenceInputMode::HiddenDelayType => {}
@@ -882,8 +909,8 @@ impl Kanata {
                             | SequenceInputMode::HiddenDelayType => {}
                             SequenceInputMode::VisibleBackspaced => {
                                 for _ in state.sequence.iter() {
-                                    self.kbd_out.press_key(OsCode::KEY_BACKSPACE)?;
-                                    self.kbd_out.release_key(OsCode::KEY_BACKSPACE)?;
+                                    self.kbd_out[output_idx].press_key(OsCode::KEY_BACKSPACE)?;
+                                    self.kbd_out[output_idx].release_key(OsCode::KEY_BACKSPACE)?;
                                 }
                             }
                         }
@@ -907,8 +934,8 @@ impl Kanata {
                             SequenceInputMode::HiddenDelayType => {
                                 for code in state.sequence.iter().copied() {
                                     if let Some(osc) = OsCode::from_u16(code) {
-                                        self.kbd_out.press_key(osc)?;
-                                        self.kbd_out.release_key(osc)?;
+                                        self.kbd_out[output_idx].press_key(osc)?;
+                                        self.kbd_out[output_idx].release_key(osc)?;
                                     }
                                 }
                             }
@@ -974,7 +1001,9 @@ impl Kanata {
                 for kc in outputs_for_key.iter().rev() {
                     if active_keycodes.contains(&kc.into()) {
                         log::debug!("repeat    {:?}", KeyCode::from(*kc));
-                        if let Err(e) = self.kbd_out.write_key(*kc, KeyValue::Repeat) {
+                        if let Err(e) = self.kbd_out[self.layout.current_key_output()]
+                            .write_key(*kc, KeyValue::Repeat)
+                        {
                             bail!("could not write key {:?}", e)
                         }
                         return Ok(());
@@ -998,7 +1027,9 @@ impl Kanata {
         for kc in outputs_for_key.iter().rev() {
             if active_keycodes.contains(&kc.into()) {
                 log::debug!("repeat    {:?}", KeyCode::from(*kc));
-                if let Err(e) = self.kbd_out.write_key(*kc, KeyValue::Repeat) {
+                if let Err(e) =
+                    self.kbd_out[self.layout.current_key_output()].write_key(*kc, KeyValue::Repeat)
+                {
                     bail!("could not write key {:?}", e)
                 }
                 return Ok(());
@@ -1089,7 +1120,7 @@ impl Kanata {
                     if kev.value == KeyValue::Release {
                         let mut k = kanata.lock();
                         info!("Init: releasing {:?}", kev.code);
-                        k.kbd_out.release_key(kev.code).expect("key released");
+                        k.kbd_out[0].release_key(kev.code).expect("key released");
                     }
                 }
                 std::thread::sleep(time::Duration::from_millis(1));

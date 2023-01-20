@@ -73,6 +73,7 @@ pub struct Cfg {
     pub layer_info: Vec<LayerInfo>,
     /// Configuration items in `defcfg`.
     pub items: HashMap<String, String>,
+    pub outputs: Vec<Output>,
     /// The keyberon layout state machine struct.
     pub layout: KanataLayout,
     /// Sequences defined in `defseq`.
@@ -81,10 +82,12 @@ pub struct Cfg {
 
 impl Cfg {
     pub fn new_from_file(p: &std::path::Path) -> Result<Self> {
-        let (items, mapped_keys, layer_info, key_outputs, layout, sequences) = parse_cfg(p)?;
+        let (items, outputs, mapped_keys, layer_info, key_outputs, layout, sequences) =
+            parse_cfg(p)?;
         log::info!("config parsed");
         Ok(Self {
             items,
+            outputs,
             mapped_keys,
             layer_info,
             key_outputs,
@@ -124,7 +127,7 @@ fn parse_default() {
 
 #[test]
 fn parse_jtroo() {
-    let (_, _, layer_strings, _, _, _) =
+    let (_, _, _, layer_strings, _, _, _) =
         parse_cfg(&std::path::PathBuf::from("./cfg_samples/jtroo.kbd")).unwrap();
     assert_eq!(layer_strings.len(), 16);
 }
@@ -136,7 +139,7 @@ fn parse_f13_f24() {
 
 #[test]
 fn parse_transparent_default() {
-    let (_, _, layer_strings, layers, _) = parse_cfg_raw(&std::path::PathBuf::from(
+    let (_, _, _, layer_strings, layers, _) = parse_cfg_raw(&std::path::PathBuf::from(
         "./cfg_samples/transparent_default.kbd",
     ))
     .unwrap();
@@ -232,16 +235,18 @@ fn parse_cfg(
     p: &std::path::Path,
 ) -> Result<(
     HashMap<String, String>,
+    Vec<Output>,
     MappedKeys,
     Vec<LayerInfo>,
     KeyOutputs,
     KanataLayout,
     KeySeqsToFKeys,
 )> {
-    let (cfg, src, layer_info, klayers, seqs) = parse_cfg_raw(p)?;
+    let (cfg, outputs, src, layer_info, klayers, seqs) = parse_cfg_raw(p)?;
 
     Ok((
         cfg,
+        outputs,
         src,
         layer_info,
         create_key_outputs(&klayers),
@@ -262,6 +267,7 @@ fn parse_cfg_raw(
     p: &std::path::Path,
 ) -> Result<(
     HashMap<String, String>,
+    Vec<Output>,
     MappedKeys,
     Vec<LayerInfo>,
     Box<KanataLayers>,
@@ -285,6 +291,12 @@ fn parse_cfg_raw(
         bail!("Only one defcfg is allowed in the configuration")
     }
     let cfg = parse_defcfg(cfg_expr)?;
+
+    let outputs = root_exprs
+        .iter()
+        .filter(gen_first_atom_filter("defout"))
+        .map(|expr| parse_defout(&expr))
+        .collect::<Result<Vec<_>>>()?;
 
     if let Some(result) = root_exprs
         .iter()
@@ -371,6 +383,7 @@ fn parse_cfg_raw(
         .collect::<Vec<_>>();
     let defsrc_layer = parse_defsrc_layer(src_expr, &mapping_order);
     let mut parsed_state = ParsedState {
+        outputs,
         layer_exprs,
         layer_idxs,
         mapping_order,
@@ -420,7 +433,14 @@ fn parse_cfg_raw(
 
     resolve_chord_groups(&mut klayers, &mut parsed_state)?;
 
-    Ok((cfg, src, layer_info, klayers, sequences))
+    Ok((
+        cfg,
+        parsed_state.outputs,
+        src,
+        layer_info,
+        klayers,
+        sequences,
+    ))
 }
 
 /// Return a closure that filters a root expression by the content of the first element. The
@@ -492,6 +512,20 @@ fn parse_defcfg(expr: &[SExpr]) -> Result<HashMap<String, String>> {
             }
         }
     }
+}
+
+fn parse_defout(expr: &[SExpr]) -> Result<Output> {
+    let mut exprs = check_first_expr(expr.iter(), "defout")?;
+    let name = match exprs.next() {
+        Some(SExpr::Atom(v)) => v.t.to_owned(),
+        v => bail!("Invalid output name {:?}", v),
+    };
+    let path = match exprs.next() {
+        Some(SExpr::Atom(v)) => Some(v.t.to_owned()),
+        None => None,
+        v => bail!("Invalid output name {:?}", v),
+    };
+    Ok(Output { name, path })
 }
 
 /// Parse custom keys from an expression starting with deflocalkeys. Statefully updates the `keys`
@@ -607,6 +641,7 @@ fn parse_layer_indexes(exprs: &[&Vec<SExpr>], expected_len: usize) -> Result<Lay
 
 #[derive(Debug)]
 struct ParsedState<'a> {
+    outputs: Vec<Output>,
     layer_exprs: Vec<&'a Vec<SExpr>>,
     aliases: Aliases,
     layer_idxs: LayerIndexes,
@@ -620,6 +655,7 @@ struct ParsedState<'a> {
 impl<'a> Default for ParsedState<'a> {
     fn default() -> Self {
         Self {
+            outputs: Default::default(),
             layer_exprs: Default::default(),
             aliases: Default::default(),
             layer_idxs: Default::default(),
@@ -630,6 +666,12 @@ impl<'a> Default for ParsedState<'a> {
             is_cmd_enabled: false,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct Output {
+    pub name: String,
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -790,6 +832,8 @@ fn parse_action_list(ac: &[SExpr], parsed_state: &ParsedState) -> Result<&'stati
     match ac_type.as_str() {
         "layer-switch" => parse_layer_base(&ac[1..], layers),
         "layer-toggle" | "layer-while-held" => parse_layer_toggle(&ac[1..], layers),
+        "output-while-held" => parse_output_while_held(&ac[1..], &parsed_state.outputs),
+        "mouse-output-while-held" => parse_mouse_output_while_held(&ac[1..], &parsed_state.outputs),
         "tap-hold" => parse_tap_hold(&ac[1..], parsed_state, HoldTapConfig::Default),
         "tap-hold-press" => parse_tap_hold(&ac[1..], parsed_state, HoldTapConfig::HoldOnOtherKeyPress),
         "tap-hold-release" => parse_tap_hold(&ac[1..], parsed_state, HoldTapConfig::PermissiveHold),
@@ -823,7 +867,7 @@ fn parse_action_list(ac: &[SExpr], parsed_state: &ParsedState) -> Result<&'stati
         "dynamic-macro-play" => parse_dynamic_macro_play(&ac[1..]),
         "cmd" => parse_cmd(&ac[1..], parsed_state.is_cmd_enabled),
         _ => bail!(
-            "Unknown action type: {}. Valid types:\n\tlayer-switch\n\tlayer-toggle | layer-while-held\n\ttap-hold | tap-hold-press | tap-hold-release\n\tmulti\n\tmacro\n\tunicode\n\tone-shot\n\ttap-dance\n\trelease-key | release-layer\n\tmwheel-up | mwheel-down | mwheel-left | mwheel-right\n\ton-press-fakekey | on-release-fakekey\n\ton-press-fakekey-delay | on-release-fakekey-delay\n\tcmd",
+            "Unknown action type: {}. Valid types:\n\tlayer-switch\n\tlayer-toggle | layer-while-held\n\ttap-hold | tap-hold-press | tap-hold-release\n\tmulti\n\tmacro\n\tunicode\n\tone-shot\n\ttap-dance\n\tchord\n\trelease-key | release-layer\n\tmwheel-up | mwheel-down | mwheel-left | mwheel-right\n\ton-press-fakekey | on-release-fakekey\n\ton-press-fakekey-delay | on-release-fakekey-delay\n\tcmd",
             ac_type
         ),
     }
@@ -859,6 +903,45 @@ fn layer_idx(ac_params: &[SExpr], layers: &LayerIndexes) -> Result<usize> {
     }
 }
 
+fn parse_output_while_held(
+    ac_params: &[SExpr],
+    outputs: &[Output],
+) -> Result<&'static KanataAction> {
+    Ok(sref(Action::Output(output_idx(ac_params, outputs)?)))
+}
+
+fn parse_mouse_output_while_held(
+    ac_params: &[SExpr],
+    outputs: &[Output],
+) -> Result<&'static KanataAction> {
+    Ok(sref(Action::MouseOutput(output_idx(ac_params, outputs)?)))
+}
+
+fn output_idx(ac_params: &[SExpr], outputs: &[Output]) -> Result<usize> {
+    if ac_params.len() != 1 {
+        bail!(
+            "output actions expect one atom: the output name. Incorrect value: {:?}",
+            ac_params
+        )
+    }
+    let output_name = match &ac_params[0] {
+        SExpr::Atom(ln) => &ln.t,
+        _ => bail!(
+            "output name should be an atom, not a list: {:?}",
+            ac_params[0]
+        ),
+    };
+    match outputs
+        .iter()
+        .position(|output| output.name == *output_name)
+    {
+        Some(i) => Ok(i),
+        None => bail!(
+            "output name {} is not declared in any defoutput",
+            output_name
+        ),
+    }
+}
 fn parse_tap_hold(
     ac_params: &[SExpr],
     parsed_state: &ParsedState,
@@ -1470,6 +1553,8 @@ fn find_chords_coords(chord_groups: &mut [ChordGroup], coord: (u8, u16), action:
         | Action::MultipleKeyCodes(_)
         | Action::Layer(_)
         | Action::DefaultLayer(_)
+        | Action::Output(_)
+        | Action::MouseOutput(_)
         | Action::Sequence { .. }
         | Action::CancelSequences
         | Action::ReleaseState(_)
@@ -1512,6 +1597,8 @@ fn fill_chords(
         | Action::MultipleKeyCodes(_)
         | Action::Layer(_)
         | Action::DefaultLayer(_)
+        | Action::Output(_)
+        | Action::MouseOutput(_)
         | Action::Sequence { .. }
         | Action::CancelSequences
         | Action::ReleaseState(_)
@@ -2008,6 +2095,8 @@ fn add_key_output_from_action_to_key_pos(
         | Action::Trans
         | Action::Layer(_)
         | Action::DefaultLayer(_)
+        | Action::Output(_)
+        | Action::MouseOutput(_)
         | Action::Sequence { .. }
         | Action::CancelSequences
         | Action::ReleaseState(_)

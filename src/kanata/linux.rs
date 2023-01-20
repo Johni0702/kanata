@@ -36,8 +36,8 @@ impl Kanata {
                     Ok(ev) => ev,
                     _ => {
                         let mut kanata = kanata.lock();
-                        kanata
-                            .kbd_out
+                        let output = kanata.layout.current_mouse_output();
+                        kanata.kbd_out[output]
                             .write(in_event)
                             .map_err(|e| anyhow!("failed write: {}", e))?;
                         continue;
@@ -49,8 +49,8 @@ impl Kanata {
                 check_for_exit(&key_event);
                 if !MAPPED_KEYS.lock().contains(&key_event.code) {
                     let mut kanata = kanata.lock();
-                    kanata
-                        .kbd_out
+                    let output = kanata.layout.current_key_output();
+                    kanata.kbd_out[output]
                         .write_key(key_event.code, key_event.value)
                         .map_err(|e| anyhow!("failed write key: {}", e))?;
                     continue;

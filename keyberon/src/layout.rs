@@ -154,6 +154,7 @@ impl<T> Default for CustomEvent<T> {
 pub enum State<T: 'static> {
     NormalKey { keycode: KeyCode, coord: (u8, u16) },
     LayerModifier { value: usize, coord: (u8, u16) },
+    OutputModifier { value: usize, mouse: bool, coord: (u8, u16) },
     Custom { value: &'static T, coord: (u8, u16) },
     FakeKey { keycode: KeyCode }, // Fake key event for sequences
     SeqCustomPending(&'static T),
@@ -180,7 +181,13 @@ impl<T: 'static> State<T> {
     /// Returns None if the key has been released and Some otherwise.
     pub fn release(&self, c: (u8, u16), custom: &mut CustomEvent<T>) -> Option<Self> {
         match *self {
-            NormalKey { coord, .. } | LayerModifier { coord, .. } if coord == c => None,
+            NormalKey { coord, .. }
+            | LayerModifier { coord, .. }
+            | OutputModifier { coord, .. }
+                if coord == c =>
+            {
+                None
+            }
             Custom { value, coord } if coord == c => {
                 custom.update(CustomEvent::Release(value));
                 None
@@ -216,6 +223,24 @@ impl<T: 'static> State<T> {
     fn get_layer(&self) -> Option<usize> {
         match self {
             LayerModifier { value, .. } => Some(*value),
+            _ => None,
+        }
+    }
+    fn get_key_output(&self) -> Option<usize> {
+        match *self {
+            OutputModifier {
+                value,
+                mouse: false,
+                ..
+            } => Some(value),
+            _ => None,
+        }
+    }
+    fn get_mouse_output(&self) -> Option<usize> {
+        match *self {
+            OutputModifier {
+                value, mouse: true, ..
+            } => Some(value),
             _ => None,
         }
     }
@@ -646,6 +671,31 @@ impl<const C: usize, const R: usize, const L: usize, T: 'static + Copy> Layout<C
     pub fn keycodes(&self) -> impl Iterator<Item = KeyCode> + '_ {
         self.states.iter().filter_map(State::keycode)
     }
+    pub fn keycodes_for_output(&self, output: usize) -> impl Iterator<Item = KeyCode> + '_ {
+        let mut active_kbd_output = 0;
+        let mut active_mouse_output = 0;
+        self.states
+            .iter()
+            .filter(move |s| {
+                if let Some(value) = s.get_key_output() {
+                    active_kbd_output = value;
+                }
+                if let Some(value) = s.get_mouse_output() {
+                    active_mouse_output = value;
+                }
+                if let Some(keycode) = s.keycode() {
+                    let active_output = if keycode.is_mouse() {
+                        active_mouse_output
+                    } else {
+                        active_kbd_output
+                    };
+                    active_output == output
+                } else {
+                    false
+                }
+            })
+            .filter_map(State::keycode)
+    }
     fn waiting_into_hold(&mut self) -> CustomEvent<T> {
         if let Some(w) = &self.waiting {
             let hold = w.hold;
@@ -1035,6 +1085,22 @@ impl<const C: usize, const R: usize, const L: usize, T: 'static + Copy> Layout<C
                 self.tap_hold_tracker.coord = coord;
                 self.set_default_layer(*value);
             }
+            &Output(value) => {
+                self.tap_hold_tracker.coord = coord;
+                let _ = self.states.push(OutputModifier {
+                    value,
+                    coord,
+                    mouse: false,
+                });
+            }
+            &MouseOutput(value) => {
+                self.tap_hold_tracker.coord = coord;
+                let _ = self.states.push(OutputModifier {
+                    value,
+                    coord,
+                    mouse: true,
+                });
+            }
             Custom(value) => {
                 self.tap_hold_tracker.coord = coord;
                 if self.states.push(State::Custom { value, coord }).is_ok() {
@@ -1062,6 +1128,26 @@ impl<const C: usize, const R: usize, const L: usize, T: 'static + Copy> Layout<C
         if value < self.layers.len() {
             self.default_layer = value
         }
+    }
+
+    pub fn current_key_output(&self) -> usize {
+        self.current_output(false)
+    }
+
+    pub fn current_mouse_output(&self) -> usize {
+        self.current_output(true)
+    }
+
+    fn current_output(&self, mouse: bool) -> usize {
+        self.states
+            .iter()
+            .rev()
+            .find_map(if mouse {
+                State::get_mouse_output
+            } else {
+                State::get_key_output
+            })
+            .unwrap_or(0)
     }
 }
 

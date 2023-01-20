@@ -319,6 +319,9 @@ where
     /// Change the default layer.
     DefaultLayer(usize),
 
+    Output(usize),
+    MouseOutput(usize),
+
     /// A sequence of SequenceEvents
     Sequence {
         /// An array of SequenceEvents that will be triggered (in order)
@@ -377,6 +380,8 @@ impl<T> Debug for Action<T> {
             Self::MultipleActions(arg0) => f.debug_tuple("MultipleActions").field(arg0).finish(),
             Self::Layer(arg0) => f.debug_tuple("Layer").field(arg0).finish(),
             Self::DefaultLayer(arg0) => f.debug_tuple("DefaultLayer").field(arg0).finish(),
+            Self::Output(arg0) => f.debug_tuple("Output").field(arg0).finish(),
+            Self::MouseOutput(arg0) => f.debug_tuple("MouseOutput").field(arg0).finish(),
             Self::HoldTap(HoldTapAction {
                 timeout,
                 hold,
