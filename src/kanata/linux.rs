@@ -38,7 +38,7 @@ impl Kanata {
                         let mut kanata = kanata.lock();
                         let output = kanata.layout.current_mouse_output();
                         kanata.kbd_out[output]
-                            .write(in_event)
+                            .write_raw(in_event)
                             .map_err(|e| anyhow!("failed write: {}", e))?;
                         continue;
                     }

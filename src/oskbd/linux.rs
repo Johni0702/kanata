@@ -246,6 +246,7 @@ pub struct KbdOut {
     accumulated_hscroll: u16,
     #[allow(dead_code)] // stored here for persistence+cleanup on exit
     symlink: Option<Symlink>,
+    raw_buf: Vec<InputEvent>,
 }
 
 pub const HI_RES_SCROLL_UNITS_IN_LO_RES: u16 = 120;
@@ -297,10 +298,25 @@ impl KbdOut {
             accumulated_scroll: 0,
             accumulated_hscroll: 0,
             symlink,
+            raw_buf: Vec::new(),
         })
     }
 
+    pub fn write_raw(&mut self, event: InputEvent) -> Result<(), io::Error> {
+        if event.event_type() == EventType::SYNCHRONIZATION {
+            self.device.emit(&self.raw_buf)?;
+            self.raw_buf.clear();
+        } else {
+            self.raw_buf.push(event);
+        }
+        Ok(())
+    }
+
     pub fn write(&mut self, event: InputEvent) -> Result<(), io::Error> {
+        if self.raw_buf.len() > 0 {
+            self.device.emit(&self.raw_buf)?;
+            self.raw_buf.clear();
+        }
         self.device.emit(&[event])?;
         Ok(())
     }
