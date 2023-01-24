@@ -57,8 +57,8 @@ use sexpr::SExpr;
 
 use self::sexpr::Spanned;
 
-pub type KanataAction = Action<&'static [&'static CustomAction]>;
-pub type KanataLayout = Layout<KEYS_IN_ROW, 2, ACTUAL_NUM_LAYERS, &'static [&'static CustomAction]>;
+pub type KanataAction = Action<'static, &'static [&'static CustomAction]>;
+pub type KanataLayout = Layout<'static, KEYS_IN_ROW, 2, ACTUAL_NUM_LAYERS, &'static [&'static CustomAction]>;
 pub type KeySeqsToFKeys = Trie<Vec<u16>, (u8, u16)>;
 
 pub struct Cfg {
@@ -1011,7 +1011,7 @@ fn parse_macro_item<'a>(
     acs: &'a [SExpr],
     parsed_state: &ParsedState,
 ) -> Result<(
-    Vec<SequenceEvent<&'static [&'static CustomAction]>>,
+    Vec<SequenceEvent<'static, &'static [&'static CustomAction]>>,
     &'a [SExpr],
 )> {
     if let Ok(duration) = parse_timeout(&acs[0]) {
